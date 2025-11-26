@@ -1,7 +1,9 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { DatabaseService } from '../database/database.service';
 import { telemetry } from '../database/schema';
+import { eq, desc } from 'drizzle-orm';
 import { TELEMETRY_INTERVAL_MS } from './telemetry.constants';
 
 @Injectable()
@@ -14,6 +16,7 @@ export class TelemetrySimulatorService implements OnModuleInit, OnModuleDestroy 
   constructor(
     private readonly db: DatabaseService,
     private readonly configService: ConfigService,
+    private readonly eventEmitter: EventEmitter2,
   ) {
     this.isDevelopment = this.configService.get<string>('NODE_ENV') === 'development';
   }
@@ -59,8 +62,10 @@ export class TelemetrySimulatorService implements OnModuleInit, OnModuleDestroy 
       const isDay = new Date().getHours() >= 6 && new Date().getHours() < 20;
       const hasSwarmRisk = Math.random() < 0.007;
 
+      const recordedAt = new Date();
       const telemetryData = {
         hiveId: 'BERLIN-ROOFTOP-01',
+        recordedAt,
         temperature: Number(this.random(18, 35).toFixed(1)),
         humidity: Number(this.random(45, 70).toFixed(1)),
         weightKg: Number((this.baseWeight += this.random(-0.02, 0.05)).toFixed(3)),
@@ -72,6 +77,22 @@ export class TelemetrySimulatorService implements OnModuleInit, OnModuleDestroy 
       };
 
       await this.db.db.insert(telemetry).values(telemetryData);
+
+      // Emit event for alert engine to process (include recordedAt for weight tracking)
+      this.eventEmitter.emit('telemetry.inserted', telemetryData);
+      
+      // Fetch the latest inserted record to get the database-generated ID
+      const [insertedRecord] = await this.db.db
+        .select()
+        .from(telemetry)
+        .where(eq(telemetry.hiveId, telemetryData.hiveId))
+        .orderBy(desc(telemetry.recordedAt))
+        .limit(1);
+
+      if (insertedRecord) {
+        // Emit event for WebSocket gateway with complete data including ID
+        this.eventEmitter.emit('telemetry.created', insertedRecord);
+      }
 
       this.logger.debug(`Telemetry data stored: ${JSON.stringify(telemetryData)}`);
     } catch (error) {
